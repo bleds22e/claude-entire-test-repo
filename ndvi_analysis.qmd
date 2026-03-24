@@ -1,0 +1,941 @@
+---
+title: "NDVI Time Series Analysis (1984–2025)"
+subtitle: "SE Arizona Study Area — Near Portal, Cochise County"
+author: "Analysis Document"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-title: "Contents"
+    code-fold: show
+    code-tools: true
+    theme: cosmo
+    embed-resources: true
+    fig-width: 10
+    fig-height: 6
+execute:
+  warning: false
+  message: false
+  eval: false   # Global default — individual chunks override this
+---
+
+# Overview
+
+This document finds, downloads, and cleans NDVI (Normalized Difference Vegetation Index) data for a small study area in southeastern Arizona from the earliest reliable satellite record through 2025. **Three independent data acquisition paths are provided** — choose the one that fits your environment.
+
+## Study Area
+
+The bounding box is defined by two corners:
+
+| Corner | Latitude  | Longitude   |
+|--------|-----------|-------------|
+| NE     | 31.939848 | −109.077395 |
+| SW     | 31.935964 | −109.083181 |
+
+The box spans roughly **580 m (E–W) × 440 m (N–S)**, placing it in the Peloncillo Mountains straddling the Arizona/New Mexico border. Vegetation in this Sky Island region transitions from Chihuahuan Desert scrub to oak woodland at higher elevations, making long-term NDVI trends ecologically informative.
+
+## Data Source
+
+All three options draw from **Landsat Collection 2 Level-2 Surface Reflectance** (30 m resolution), merging Landsat 4, 5, 7, 8, and 9 into a single time series.
+
+> **Note on the 1980–1984 gap:** Landsat 5 launched March 1984. The only sensor available before that date is NOAA AVHRR (from 1981), which has 8 km resolution — a single pixel covering the entire study area. Pixel-scale NDVI is not meaningful at that resolution for a 580 × 440 m site. The practical earliest date for reliable 30 m NDVI here is therefore **1984**.
+
+## Choosing an Acquisition Method {#sec-choose}
+
+Three options are provided. **Activate exactly one** by setting its first chunk's `eval:` flag to `true` before rendering.
+
+|   | Option A — GEE | Option B — Planetary Computer (Python) | Option C — Pure R |
+|----|----|----|----|
+| **Account needed** | Yes (free) | No | No |
+| **Languages** | Python | Python | R only |
+| **Processing location** | Google's servers | Local machine | Local machine |
+| **Downloads rasters** | No | Yes (small clips) | Yes (small clips) |
+| **Best for** | Large AOIs, long records | No-account Python workflow | R-only environment |
+| **Main dependency** | `earthengine-api` | `pystac-client`, `rioxarray` | `rstac`, `gdalcubes` |
+
+All three write identical output to `data/ndvi_raw.csv`, so the cleaning and analysis sections that follow work regardless of which path was used.
+
+------------------------------------------------------------------------
+
+## Language Rationale
+
+> **Why Python for acquisition (Options A & B)?** The Google Earth Engine Python client (`earthengine-api`) is the industry-standard tool for large-scale remote sensing time series — server-side computation means no raster downloads. The Planetary Computer Python stack (`pystac-client` + `rioxarray`) is the natural Python interface to Microsoft's STAC catalog, and both ecosystems have far more documentation and community support than their R equivalents for these specific tasks. Option C demonstrates that R can do the same job, at the cost of slightly more boilerplate.
+
+> **Why R for cleaning and analysis?** Once the data land as a CSV, R's `tidyverse` ecosystem (`dplyr`, `lubridate`, `ggplot2`) provides expressive, readable pipelines for cleaning, outlier detection, and visualisation. The `forecast` and `trend` packages add statistical time-series tools with minimal boilerplate. "Tasks that talk to the satellite archive stay in Python; tasks that make sense of the data stay in R."
+
+------------------------------------------------------------------------
+
+# Part 0 — Shared Constants
+
+These coordinate constants are defined in both Python and R so each section can be run independently.
+
+```{python}
+#| label: py-constants
+#| eval: false   # sourced by Options A and B — do not change
+
+SW_LAT, SW_LON =  31.935964, -109.083181   # southwest corner (lat, lon)
+NE_LAT, NE_LON =  31.939848, -109.077395   # northeast corner (lat, lon)
+
+START_DATE = "1984-01-01"
+END_DATE   = "2025-12-31"
+```
+
+```{r}
+#| label: r-constants
+#| eval: true   # always run — R cleaning section needs these
+
+SW_LAT <- 31.935964; SW_LON <- -109.083181
+NE_LAT <- 31.939848; NE_LON <- -109.077395
+
+START_DATE <- "1984-01-01"
+END_DATE   <- "2025-12-31"
+```
+
+------------------------------------------------------------------------
+
+# Part 1A — Option A: Google Earth Engine (Python) {#sec-gee}
+
+> **Requires:** A free GEE account + Google Cloud project. Run `earthengine authenticate` once in a terminal before using this section. Install: `pip install earthengine-api geemap pandas numpy`
+>
+> **To activate this option:** change the first chunk below from `eval: false` to `eval: true`, then render.
+
+Computation runs entirely on Google's servers — no rasters are downloaded. This is the recommended option for reproducibility across large time ranges.
+
+## 1A.1 Initialise Earth Engine
+
+```{python}
+#| label: gee-init
+#| eval: false   # ← SET TO true TO USE THIS OPTION
+
+import ee
+import pandas as pd
+import numpy as np
+import os
+
+# Replace 'your-project-id' with your GEE Cloud project ID.
+# Credentials are read from the cache created by `earthengine authenticate`.
+ee.Initialize(project="your-project-id")
+print("Earth Engine initialised.")
+```
+
+## 1A.2 Area of Interest
+
+```{python}
+#| label: gee-aoi
+#| eval: false
+
+# GEE BBox expects (west, south, east, north) — longitude before latitude.
+aoi = ee.Geometry.BBox(
+    west  = SW_LON,
+    south = SW_LAT,
+    east  = NE_LON,
+    north = NE_LAT,
+)
+```
+
+## 1A.3 Cloud Masking
+
+Landsat Collection 2 Level-2 products carry a `QA_PIXEL` band generated by the CFmask v2 (Fmask) algorithm. Each bit indicates a specific condition:
+
+| Bit | Meaning       |
+|-----|---------------|
+| 1   | Dilated cloud |
+| 3   | Cloud         |
+| 4   | Cloud shadow  |
+
+We retain only pixels where all three bits are zero.
+
+```{python}
+#| label: gee-cloud-mask
+#| eval: false
+
+def mask_clouds_l2(image):
+    """Mask cloud/shadow pixels in a Landsat C2 SR image using QA_PIXEL bits."""
+    qa = image.select("QA_PIXEL")
+    clear = (
+        qa.bitwiseAnd(1 << 1).eq(0)   # dilated cloud
+         .And(qa.bitwiseAnd(1 << 3).eq(0))  # cloud
+         .And(qa.bitwiseAnd(1 << 4).eq(0))  # cloud shadow
+    )
+    return image.updateMask(clear)
+```
+
+## 1A.4 NDVI Functions
+
+NDVI = (NIR − Red) / (NIR + Red). Band numbering differs between sensor families — TM/ETM+ use Bands 3/4, OLI uses Bands 4/5.
+
+```{python}
+#| label: gee-ndvi
+#| eval: false
+
+def add_ndvi_tm(image):
+    """NDVI for Landsat 4, 5 (TM) and 7 (ETM+)."""
+    return image.addBands(
+        image.normalizedDifference(["SR_B4", "SR_B3"]).rename("NDVI")
+    )
+
+def add_ndvi_oli(image):
+    """NDVI for Landsat 8 and 9 (OLI / OLI-2)."""
+    return image.addBands(
+        image.normalizedDifference(["SR_B5", "SR_B4"]).rename("NDVI")
+    )
+```
+
+## 1A.5 Assemble Collections
+
+```{python}
+#| label: gee-collections
+#| eval: false
+
+# Landsat 4 TM (1982–1993) — sparse coverage
+l4 = (ee.ImageCollection("LANDSAT/LT04/C02/T1_L2")
+      .filterBounds(aoi).filterDate(START_DATE, "1993-12-31")
+      .map(mask_clouds_l2).map(add_ndvi_tm))
+
+# Landsat 5 TM (1984–2012) — primary sensor for the 1980s–2000s
+l5 = (ee.ImageCollection("LANDSAT/LT05/C02/T1_L2")
+      .filterBounds(aoi).filterDate("1984-01-01", "2013-06-05")
+      .map(mask_clouds_l2).map(add_ndvi_tm))
+
+# Landsat 7 ETM+ (1999–2021)
+# ⚠ The Scan Line Corrector (SLC) failed 31 May 2003, leaving ~22% data gaps
+# per scene. We include post-SLC scenes but flag them for the cleaning step.
+l7 = (ee.ImageCollection("LANDSAT/LE07/C02/T1_L2")
+      .filterBounds(aoi).filterDate("1999-01-01", "2021-12-31")
+      .map(mask_clouds_l2).map(add_ndvi_tm))
+
+# Landsat 8 OLI (2013–present)
+l8 = (ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
+      .filterBounds(aoi).filterDate("2013-04-11", END_DATE)
+      .map(mask_clouds_l2).map(add_ndvi_oli))
+
+# Landsat 9 OLI-2 (2021–present)
+l9 = (ee.ImageCollection("LANDSAT/LC09/C02/T1_L2")
+      .filterBounds(aoi).filterDate("2021-10-31", END_DATE)
+      .map(mask_clouds_l2).map(add_ndvi_oli))
+
+all_landsat = (l4.merge(l5).merge(l7).merge(l8).merge(l9)
+               .select("NDVI").sort("system:time_start"))
+
+print(f"Total scenes after cloud masking: {all_landsat.size().getInfo()}")
+```
+
+## 1A.6 Extract Time Series
+
+```{python}
+#| label: gee-extract
+#| eval: false
+
+def extract_mean_ndvi(image):
+    """Reduce one scene to spatial mean NDVI over the AOI."""
+    stats = image.reduceRegion(
+        reducer   = ee.Reducer.mean(),
+        geometry  = aoi,
+        scale     = 30,
+        maxPixels = 1e6,
+    )
+    return ee.Feature(None, {
+        "date"    : image.date().format("YYYY-MM-dd"),
+        "ndvi"    : stats.get("NDVI"),
+        "scene_id": image.get("LANDSAT_SCENE_ID"),
+        "sensor"  : image.get("SPACECRAFT_ID"),
+    })
+
+features = all_landsat.map(extract_mean_ndvi).getInfo()
+records  = [f["properties"] for f in features["features"]]
+df       = pd.DataFrame(records)
+
+print(f"Rows extracted: {len(df)}")
+print(df.head())
+```
+
+## 1A.7 Save to Disk
+
+```{python}
+#| label: gee-save
+#| eval: false
+
+os.makedirs("data", exist_ok=True)
+df.to_csv("data/ndvi_raw.csv", index=False)
+print("Saved → data/ndvi_raw.csv")
+```
+
+------------------------------------------------------------------------
+
+# Part 1B — Option B: Microsoft Planetary Computer (Python) {#sec-pc}
+
+> **Requires:** No account. Data is publicly accessible. Install: `pip install pystac-client planetary-computer rioxarray rasterio numpy pandas`
+>
+> **To activate this option:** change the first chunk below from `eval: false` to `eval: true`, then render.
+
+Planetary Computer hosts the same Landsat Collection 2 Level-2 data as GEE. This option downloads small raster chips for the AOI and computes NDVI locally. For a 580 × 440 m clip at 30 m resolution that is roughly 20 × 15 = 300 pixels per band — negligible download size (\~50 KB per scene).
+
+## 1B.1 Imports
+
+```{python}
+#| label: pc-imports
+#| eval: false   # ← SET TO true TO USE THIS OPTION
+
+import pystac_client
+import planetary_computer
+import rioxarray as rxr
+import numpy as np
+import pandas as pd
+import os
+from tqdm import tqdm   # progress bar — install with: pip install tqdm
+```
+
+## 1B.2 Query the STAC Catalog
+
+```{python}
+#| label: pc-query
+#| eval: false
+
+# Open the Planetary Computer STAC API.
+# sign_inplace automatically appends a SAS token to each asset URL.
+catalog = pystac_client.Client.open(
+    "https://planetarycomputer.microsoft.com/api/stac/v1",
+    modifier=planetary_computer.sign_inplace,
+)
+
+# Pre-filter to scenes with < 70% cloud cover reported in metadata.
+# Fine-grained cloud masking happens per-pixel below.
+search = catalog.search(
+    collections = ["landsat-c2-l2"],
+    bbox        = [SW_LON, SW_LAT, NE_LON, NE_LAT],
+    datetime    = f"{START_DATE}/{END_DATE}",
+    query       = {"eo:cloud_cover": {"lt": 70}},
+    max_items   = None,   # retrieve all matching scenes
+)
+
+items = list(search.items())
+print(f"Found {len(items)} scenes with < 70% cloud cover")
+```
+
+## 1B.3 Cloud-Mask Helper
+
+```{python}
+#| label: pc-cloud-fn
+#| eval: false
+
+def apply_cloud_mask(qa_array: np.ndarray) -> np.ndarray:
+    """
+    Return a boolean array (True = clear pixel) from a QA_PIXEL array.
+    Identical logic to Option A — bits 1, 3, 4 indicate cloud conditions.
+    """
+    qa = qa_array.astype(np.int32)
+    return (
+        (qa & (1 << 1) == 0) &   # dilated cloud
+        (qa & (1 << 3) == 0) &   # cloud
+        (qa & (1 << 4) == 0)     # cloud shadow
+    )
+```
+
+## 1B.4 Extract NDVI Per Scene
+
+The TM/ETM+ vs. OLI band-naming difference means we must inspect `platform` metadata before selecting the red and NIR assets.
+
+```{python}
+#| label: pc-extract
+#| eval: false
+
+# Band asset names per sensor family
+BAND_MAP = {
+    "landsat-4": ("SR_B3", "SR_B4"),
+    "landsat-5": ("SR_B3", "SR_B4"),
+    "landsat-7": ("SR_B3", "SR_B4"),   # TM/ETM+: red = B3, NIR = B4
+    "landsat-8": ("SR_B4", "SR_B5"),   # OLI:     red = B4, NIR = B5
+    "landsat-9": ("SR_B4", "SR_B5"),
+}
+
+bbox = [SW_LON, SW_LAT, NE_LON, NE_LAT]
+records = []
+
+for item in tqdm(items, desc="Processing scenes"):
+    platform = item.properties.get("platform", "")
+    if platform not in BAND_MAP:
+        continue
+
+    red_key, nir_key = BAND_MAP[platform]
+
+    try:
+        # Read only the small AOI window from the COG (Cloud-Optimised GeoTIFF).
+        # rioxarray's clip_box issues a partial HTTP range request — it does NOT
+        # download the full scene (~1 GB).
+        red = rxr.open_rasterio(item.assets[red_key].href,  masked=True).squeeze()
+        nir = rxr.open_rasterio(item.assets[nir_key].href,  masked=True).squeeze()
+        qa  = rxr.open_rasterio(item.assets["QA_PIXEL"].href, masked=False).squeeze()
+
+        red = red.rio.clip_box(*bbox, crs="EPSG:4326")
+        nir = nir.rio.clip_box(*bbox, crs="EPSG:4326")
+        qa  = qa.rio.clip_box(*bbox, crs="EPSG:4326")
+
+        clear = apply_cloud_mask(qa.values)
+
+        r = red.values.astype(float); r[~clear] = np.nan
+        n = nir.values.astype(float); n[~clear] = np.nan
+
+        ndvi_mean = float(np.nanmean((n - r) / (n + r + 1e-10)))
+
+        if not np.isnan(ndvi_mean):
+            records.append({
+                "date"    : item.datetime.strftime("%Y-%m-%d"),
+                "ndvi"    : ndvi_mean,
+                "scene_id": item.id,
+                "sensor"  : platform.upper().replace("-", "_"),
+            })
+
+    except Exception as exc:
+        print(f"  Skipped {item.id}: {exc}")
+
+df = pd.DataFrame(records).sort_values("date").reset_index(drop=True)
+print(f"Extracted NDVI for {len(df)} scenes")
+print(df.head())
+```
+
+## 1B.5 Save to Disk
+
+```{python}
+#| label: pc-save
+#| eval: false
+
+os.makedirs("data", exist_ok=True)
+df.to_csv("data/ndvi_raw.csv", index=False)
+print("Saved → data/ndvi_raw.csv")
+```
+
+------------------------------------------------------------------------
+
+# Part 1C — Option C: Pure R (`rstac` + `gdalcubes`) {#sec-r-only}
+
+> **Requires:** No account. Data is publicly accessible. Install R packages: `install.packages(c("rstac", "gdalcubes", "sf", "terra", "tidyverse"))` GDAL ≥ 3.1 must be installed on your system (comes with most spatial R installs).
+>
+> **To activate this option:** change the first chunk below from `eval: false` to `eval: true`, then render.
+
+This option demonstrates that the full acquisition pipeline is possible in R alone. It queries the same Planetary Computer STAC API and uses `gdalcubes` to stream small raster windows on demand — no Python required.
+
+## 1C.1 Load Packages
+
+```{r}
+#| label: r-only-pkgs
+#| eval: false   # ← SET TO true TO USE THIS OPTION
+
+library(rstac)      # STAC API queries
+library(gdalcubes)  # on-demand raster data cube processing
+library(sf)         # spatial reference handling
+library(terra)      # fallback raster I/O (used for QA masking)
+library(tidyverse)
+library(lubridate)
+
+# Enable parallel reads in gdalcubes (speeds up multi-scene processing)
+gdalcubes_options(parallel = TRUE)
+```
+
+## 1C.2 Query the STAC Catalog
+
+```{r}
+#| label: r-only-query
+#| eval: false
+
+# rstac connects to any STAC-compliant API.
+# items_fetch() paginates automatically to retrieve all results.
+items_raw <- stac("https://planetarycomputer.microsoft.com/api/stac/v1") |>
+  stac_search(
+    collections = "landsat-c2-l2",
+    bbox        = c(SW_LON, SW_LAT, NE_LON, NE_LAT),
+    datetime    = paste(START_DATE, END_DATE, sep = "/"),
+    limit       = 250   # page size; items_fetch() will page through all results
+  ) |>
+  get_request() |>
+  items_fetch()
+
+# Sign all asset URLs with a Planetary Computer SAS token so GDAL can read them
+items_signed <- items_raw |>
+  items_sign(sign_fn = sign_planetary_computer())
+
+n_items <- length(items_signed$features)
+cat(sprintf("Found %d scenes\n", n_items))
+```
+
+## 1C.3 Build Sensor-Stratified Image Collections
+
+`gdalcubes` requires knowing which asset contains each band. Because band numbers differ between TM/ETM+ (Landsat 4/5/7) and OLI (Landsat 8/9), we build two image collections and process them separately, then combine the resulting time series tables.
+
+```{r}
+#| label: r-only-collections
+#| eval: false
+
+# Helper: extract platform from a STAC item
+get_platform <- function(item) item$properties$platform
+
+# Separate by sensor family
+is_tm  <- map_lgl(items_signed$features, ~ get_platform(.x) %in%
+                    c("landsat-4", "landsat-5", "landsat-7"))
+is_oli <- map_lgl(items_signed$features, ~ get_platform(.x) %in%
+                    c("landsat-8", "landsat-9"))
+
+features_tm  <- items_signed$features[is_tm]
+features_oli <- items_signed$features[is_oli]
+
+cat(sprintf("TM/ETM+ scenes : %d\n", length(features_tm)))
+cat(sprintf("OLI scenes     : %d\n", length(features_oli)))
+
+# Build gdalcubes image collections
+# asset_names: which STAC asset keys to load
+# band_names:  rename them to consistent internal names
+make_collection <- function(features, red_asset, nir_asset) {
+  if (length(features) == 0) return(NULL)
+  stac_image_collection(
+    features,
+    asset_names = c(red_asset, nir_asset, "QA_PIXEL"),
+    band_names  = c("red", "nir", "qa")
+  )
+}
+
+col_tm  <- make_collection(features_tm,  "SR_B3", "SR_B4")
+col_oli <- make_collection(features_oli, "SR_B4", "SR_B5")
+```
+
+## 1C.4 Define Data Cube View
+
+A `cube_view` specifies the target spatial extent, CRS, resolution, and time step. Setting `dt = "P1D"` gives one composite per calendar day; scenes on the same day are aggregated by the chosen `aggregation` method.
+
+```{r}
+#| label: r-only-cube-view
+#| eval: false
+
+aoi_view <- cube_view(
+  srs         = "EPSG:4326",
+  extent      = list(
+    left   = SW_LON, right  = NE_LON,
+    bottom = SW_LAT, top    = NE_LAT,
+    t0     = START_DATE, t1 = END_DATE
+  ),
+  dx          = 0.00027,   # ≈ 30 m in decimal degrees at this latitude
+  dy          = 0.00027,
+  dt          = "P1D",     # one time slice per calendar day
+  aggregation = "median",  # median composite when multiple scenes fall on same day
+  resampling  = "bilinear"
+)
+```
+
+## 1C.5 Compute NDVI and Reduce to Spatial Mean
+
+```{r}
+#| label: r-only-ndvi
+#| eval: false
+
+# Cloud-mask expression: QA bits 1, 3, 4 — same logic as Options A & B.
+# gdalcubes apply_pixel() accepts C-style expressions over band names.
+CLOUD_MASK_EXPR <- "
+  (((int)qa & (1 << 1)) == 0) &&
+  (((int)qa & (1 << 3)) == 0) &&
+  (((int)qa & (1 << 4)) == 0)
+"
+
+process_collection <- function(col, sensor_label) {
+  if (is.null(col)) return(tibble())
+
+  raster_cube(col, aoi_view) |>
+    # Apply cloud mask: set red and nir to NA where not clear
+    apply_pixel(
+      c(
+        sprintf("(%s) ? red : NAN", CLOUD_MASK_EXPR),
+        sprintf("(%s) ? nir : NAN", CLOUD_MASK_EXPR)
+      ),
+      names = c("red_clear", "nir_clear")
+    ) |>
+    # Compute NDVI
+    apply_pixel(
+      "(nir_clear - red_clear) / (nir_clear + red_clear)",
+      names = "ndvi"
+    ) |>
+    # Spatial mean per time step — collapses the small AOI to one value per day
+    reduce_space("mean(ndvi)") |>
+    as_tibble() |>
+    rename(date = time, ndvi = ndvi) |>
+    filter(!is.na(ndvi)) |>
+    mutate(
+      date   = as.Date(date),
+      sensor = sensor_label
+    )
+}
+
+ts_tm  <- process_collection(col_tm,  "LANDSAT_TM_ETM")
+ts_oli <- process_collection(col_oli, "LANDSAT_OLI")
+
+df_r <- bind_rows(ts_tm, ts_oli) |>
+  arrange(date) |>
+  # gdalcubes does not expose scene-level IDs; use date+sensor as surrogate
+  mutate(scene_id = paste(date, sensor, sep = "_"))
+
+cat(sprintf("Extracted %d observations\n", nrow(df_r)))
+glimpse(df_r)
+```
+
+## 1C.6 Save to Disk
+
+```{r}
+#| label: r-only-save
+#| eval: false
+
+dir.create("data", showWarnings = FALSE)
+write_csv(df_r, "data/ndvi_raw.csv")
+cat("Saved → data/ndvi_raw.csv\n")
+```
+
+------------------------------------------------------------------------
+
+# Part 2 — Data Cleaning (R)
+
+This section reads `data/ndvi_raw.csv` regardless of which acquisition option was used. All three options write the same four columns: `date`, `ndvi`, `scene_id`, `sensor`.
+
+## 2.1 Load Packages
+
+```{r}
+#| label: r-clean-pkgs
+#| eval: true
+
+library(tidyverse)
+library(lubridate)
+library(zoo)
+library(knitr)
+```
+
+## 2.2 Load and Inspect Raw Data
+
+```{r}
+#| label: r-load
+#| eval: true
+
+raw <- read_csv(
+  "data/ndvi_raw.csv",
+  col_types = cols(
+    date     = col_date(format = "%Y-%m-%d"),
+    ndvi     = col_double(),
+    scene_id = col_character(),
+    sensor   = col_character()
+  )
+)
+
+glimpse(raw)
+
+raw |>
+  count(sensor, name = "n_scenes") |>
+  kable(caption = "Scene count by sensor (raw)")
+
+cat(sprintf(
+  "Date range: %s  →  %s\n",
+  min(raw$date, na.rm = TRUE),
+  max(raw$date, na.rm = TRUE)
+))
+```
+
+```{r}
+#| label: fig-raw-ts
+#| eval: true
+#| fig-cap: "Raw NDVI values before cleaning, coloured by sensor."
+
+ggplot(raw, aes(x = date, y = ndvi, colour = sensor)) +
+  geom_point(alpha = 0.35, size = 0.7) +
+  scale_colour_brewer(palette = "Set1") +
+  labs(title = "Raw Landsat NDVI — all scenes",
+       x = NULL, y = "Mean NDVI", colour = "Sensor") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+## 2.3 Cleaning Pipeline
+
+### Step 1 — Drop rows with no valid pixels
+
+Some scenes return `NA` if the AOI was 100% cloud-covered after masking.
+
+```{r}
+#| label: r-step1
+#| eval: true
+
+step1 <- raw |> filter(!is.na(ndvi))
+cat(sprintf("Step 1 — dropped %d NA rows\n", nrow(raw) - nrow(step1)))
+```
+
+### Step 2 — Physical bounds filter
+
+NDVI is bounded \[−1, 1\] by definition. Values below −0.2 or above 0.9 for a semi-arid shrubland almost always indicate residual cloud contamination, instrument artefact, or snow/ice.
+
+```{r}
+#| label: r-step2
+#| eval: true
+
+NDVI_MIN <- -0.2
+NDVI_MAX <-  0.9
+
+step2 <- step1 |> filter(between(ndvi, NDVI_MIN, NDVI_MAX))
+cat(sprintf(
+  "Step 2 — removed %d rows outside [%.1f, %.1f]\n",
+  nrow(step1) - nrow(step2), NDVI_MIN, NDVI_MAX
+))
+```
+
+### Step 3 — Flag Landsat 7 SLC-off scenes
+
+The Scan Line Corrector failed on 31 May 2003. Post-failure scenes have \~22% striped data loss. For a small AOI the spatial mean may be biased if the missing stripes happen to fall on vegetation. We flag rather than remove so analysts can choose to exclude them.
+
+```{r}
+#| label: r-step3
+#| eval: true
+
+SLC_FAIL <- as.Date("2003-06-01")
+
+step3 <- step2 |>
+  mutate(slc_off = (sensor %in% c("LANDSAT_7", "LANDSAT_TM_ETM")) &
+                    (date >= SLC_FAIL))
+
+cat(sprintf(
+  "Step 3 — flagged %d Landsat 7 SLC-off scenes (%.1f%%)\n",
+  sum(step3$slc_off),
+  100 * mean(step3$slc_off)
+))
+```
+
+### Step 4 — Month-stratified outlier removal
+
+Residual cloud contamination typically drives NDVI unusually low; smoke can drive it high. A 3×IQR fence computed within each calendar month avoids discarding the legitimately high NDVI values that occur during the summer monsoon (July–September) — a global fence would treat monsoon-season peaks as outliers.
+
+```{r}
+#| label: r-step4
+#| eval: true
+
+step4 <- step3 |>
+  mutate(month = month(date)) |>
+  group_by(month) |>
+  mutate(
+    q25     = quantile(ndvi, 0.25, na.rm = TRUE),
+    q75     = quantile(ndvi, 0.75, na.rm = TRUE),
+    iqr     = q75 - q25,
+    outlier = ndvi < (q25 - 3 * iqr) | ndvi > (q75 + 3 * iqr)
+  ) |>
+  ungroup() |>
+  filter(!outlier) |>
+  select(-q25, -q75, -iqr, -outlier, -month)
+
+cat(sprintf(
+  "Step 4 — removed %d monthly outliers\n",
+  nrow(step3) - nrow(step4)
+))
+```
+
+### Step 5 — De-duplicate same-date observations
+
+Path/row overlaps can produce two scenes on the same calendar day. We keep the observation with the higher NDVI (a proxy for less cloud contamination when values are otherwise similar).
+
+```{r}
+#| label: r-step5
+#| eval: true
+
+step5 <- step4 |>
+  group_by(date) |>
+  slice_max(ndvi, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  arrange(date)
+
+cat(sprintf(
+  "Step 5 — de-duplicated: %d → %d rows\n",
+  nrow(step4), nrow(step5)
+))
+```
+
+## 2.4 Cleaning Summary
+
+```{r}
+#| label: r-clean-summary
+#| eval: true
+
+tibble(
+  Step = c(
+    "Raw", "1 — NA removal", "2 — range filter",
+    "3 — SLC flag", "4 — outlier removal", "5 — de-duplication"
+  ),
+  `Row count`    = c(nrow(raw), nrow(step1), nrow(step2),
+                     nrow(step3), nrow(step4), nrow(step5)),
+) |>
+  mutate(`Rows removed` = lag(`Row count`, default = nrow(raw)) - `Row count`) |>
+  kable(caption = "Data volume at each cleaning step")
+```
+
+## 2.5 Save Cleaned Data
+
+```{r}
+#| label: r-save-clean
+#| eval: true
+
+dir.create("data", showWarnings = FALSE)
+write_csv(step5, "data/ndvi_clean.csv")
+cat("Saved → data/ndvi_clean.csv\n")
+```
+
+------------------------------------------------------------------------
+
+# Part 3 — Analysis & Visualisation (R)
+
+## 3.1 Long-Term Time Series
+
+```{r}
+#| label: r-load-clean
+#| eval: true
+
+library(forecast)  # STL decomposition
+library(ggridges)  # ridge plots
+library(patchwork) # combine panels
+library(scales)
+
+ndvi_clean <- read_csv("data/ndvi_clean.csv",
+                       col_types = cols(date = col_date()))
+```
+
+```{r}
+#| label: fig-clean-ts
+#| eval: true
+#| fig-cap: "Cleaned NDVI time series with a 1-year rolling mean."
+
+ndvi_roll <- ndvi_clean |>
+  arrange(date) |>
+  mutate(
+    ndvi_roll = rollapply(ndvi, width = 23, FUN = mean,
+                          fill = NA, align = "center", partial = TRUE)
+  )
+
+ggplot(ndvi_roll, aes(x = date)) +
+  geom_point(aes(y = ndvi, colour = sensor), alpha = 0.25, size = 0.6) +
+  geom_line(aes(y = ndvi_roll), colour = "black", linewidth = 0.8) +
+  scale_colour_brewer(palette = "Set1", name = "Sensor") +
+  scale_x_date(breaks = "5 years", date_labels = "%Y") +
+  labs(
+    title    = "Landsat NDVI — SE Arizona (1984–2025)",
+    subtitle = "Points: individual scenes  |  Line: 1-year rolling mean",
+    x = NULL, y = "Mean NDVI"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+## 3.2 Seasonal Patterns by Decade
+
+The North American Monsoon drives a predictable summer green-up (July–September). Ridge plots reveal whether the seasonal amplitude or timing has shifted.
+
+```{r}
+#| label: fig-seasonal-ridge
+#| eval: true
+#| fig-cap: "Monthly NDVI distributions by decade. Rightward shifts indicate higher vegetation productivity."
+
+ndvi_clean |>
+  mutate(
+    month_name = factor(month.abb[month(date)], levels = month.abb),
+    decade     = paste0(floor(year(date) / 10) * 10, "s")
+  ) |>
+  ggplot(aes(x = ndvi, y = month_name, fill = decade)) +
+  geom_density_ridges(alpha = 0.55, scale = 1.2, rel_min_height = 0.02) +
+  scale_fill_viridis_d(option = "plasma", direction = -1) +
+  labs(title = "Monthly NDVI distributions by decade",
+       x = "Mean NDVI", y = NULL, fill = "Decade") +
+  theme_ridges(font_size = 11) +
+  theme(legend.position = "right")
+```
+
+## 3.3 Annual Monsoon-Season NDVI
+
+July–September (JAS) NDVI is a standard productivity index for Chihuahuan / Sonoran Desert grasslands and the most ecologically meaningful seasonal window in this region.
+
+```{r}
+#| label: fig-annual-monsoon
+#| eval: true
+#| fig-cap: "Annual monsoon-season (JAS) mean NDVI with a linear OLS trend."
+
+monsoon_annual <- ndvi_clean |>
+  filter(month(date) %in% 7:9) |>
+  group_by(year = year(date)) |>
+  summarise(ndvi_mean = mean(ndvi, na.rm = TRUE), n = n(), .groups = "drop") |>
+  filter(n >= 3)   # need ≥ 3 scenes to compute a stable seasonal mean
+
+ggplot(monsoon_annual, aes(x = year, y = ndvi_mean)) +
+  geom_col(fill = "#4dac26", alpha = 0.7) +
+  geom_smooth(method = "lm", se = TRUE, colour = "black", linewidth = 0.8) +
+  scale_x_continuous(breaks = seq(1985, 2025, 5)) +
+  labs(
+    title    = "Annual monsoon-season (JAS) mean NDVI",
+    subtitle = "Bar = annual mean  |  Line = OLS trend ± 95% CI",
+    x = "Year", y = "Mean NDVI (JAS)"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+## 3.4 Long-Term Trend Test (Mann–Kendall)
+
+The Mann–Kendall test is non-parametric and robust to non-normal distributions and tied values — appropriate for NDVI data. We apply it to the annual monsoon means (one value per year) to avoid autocorrelation inflating significance in the scene-level series.
+
+```{r}
+#| label: r-mk-test
+#| eval: true
+
+if (!requireNamespace("trend", quietly = TRUE)) install.packages("trend")
+library(trend)
+
+mk <- mk.test(monsoon_annual$ndvi_mean)
+
+cat("Mann–Kendall trend test on annual monsoon (JAS) NDVI\n")
+cat(sprintf("  tau        = %+.3f\n", mk$estimates["tau"]))
+cat(sprintf("  p-value    = %.4f\n",  mk$p.value))
+cat(sprintf("  Direction  : %s\n",
+    ifelse(mk$estimates["tau"] > 0, "increasing", "decreasing")))
+cat(sprintf("  Significant at α=0.05: %s\n",
+    ifelse(mk$p.value < 0.05, "YES", "no")))
+```
+
+## 3.5 STL Decomposition
+
+STL (Seasonal-Trend decomposition using Loess) separates the monthly mean NDVI into trend, seasonal, and remainder components. Short gaps (≤ 2 months) are interpolated before decomposition.
+
+```{r}
+#| label: fig-stl
+#| eval: true
+#| fig-cap: "STL decomposition of monthly mean NDVI into trend, seasonal cycle, and residuals."
+
+# Aggregate to monthly means
+monthly <- ndvi_clean |>
+  mutate(ym = floor_date(date, "month")) |>
+  group_by(ym) |>
+  summarise(ndvi = mean(ndvi, na.rm = TRUE), .groups = "drop") |>
+  complete(ym = seq(min(ym), max(ym), by = "month")) |>
+  arrange(ym) |>
+  mutate(ndvi_interp = na.approx(ndvi, maxgap = 2, na.rm = FALSE))
+
+# Build regular ts object
+ndvi_ts <- ts(
+  monthly$ndvi_interp,
+  start     = c(year(min(monthly$ym)), month(min(monthly$ym))),
+  frequency = 12
+)
+
+stl_fit <- stl(ndvi_ts, s.window = "periodic", robust = TRUE,
+               na.action = na.interp)
+
+autoplot(stl_fit) +
+  labs(
+    title   = "STL decomposition of monthly mean NDVI",
+    caption = "s.window = periodic  |  robust = TRUE"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+------------------------------------------------------------------------
+
+# Session Information
+
+```{r}
+#| label: r-session
+#| eval: true
+#| code-fold: true
+
+sessionInfo()
+```
