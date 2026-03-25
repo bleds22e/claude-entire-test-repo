@@ -1,0 +1,56 @@
+how to install python library
+
+---
+
+bash: command not found: pip
+
+---
+
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+  File "/Users/ebledsoe/Library/R/x86_64/4.5/library/reticulate/python/rpytools/loader.py", line 122, in _find_and_load_hook
+    return _run_hook(name, _hook)
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/ebledsoe/Library/R/x86_64/4.5/library/reticulate/python/rpytools/loader.py", line 96, in _run_hook
+    module = hook()
+             ^^^^^^
+  File "/Users/ebledsoe/Library/R/x86_64/4.5/library/reticulate/python/rpytools/loader.py", line 120, in _hook
+    return _find_and_load(name, import_)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ModuleNotFoundError: No module named 'pystac_client'
+
+---
+
+should it be using reticulate?
+
+---
+
+should it be using reticulate?
+
+---
+
+Warning in reticulate::py_install("pystac-client", pip = TRUE) :
+  An ephemeral virtual environment managed by 'reticulate' is currently in use.
+To add more packages to your current session, call `py_require()` instead
+of `py_install()`. Running:
+  `py_require(c("pystac-client"))`
+
+---
+
+Error in 1C.5:
+
+---
+
+Different error: Error: ERROR in apply_pixel_cube::apply_pixel_cube(): Invalid expression(s)
+
+---
+
+still the same error with ts_tm  <- process_tm(col_tm,   "LANDSAT_TM_ETM")
+
+---
+
+Please run through all of Part 1C and fix errors
+
+---
+
+still getting the same error in Part 1C 5
