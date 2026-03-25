@@ -37,7 +37,10 @@ The box spans roughly **580 m (E–W) × 440 m (N–S)**, placing it in the Pelo
 
 ## Data Source
 
-All three options draw from **Landsat Collection 2 Level-2 Surface Reflectance** (30 m resolution), merging Landsat 4, 5, 7, 8, and 9 into a single time series.
+All three options draw from **Landsat Collection 2 Level-2 Surface Reflectance** (30 m resolution), merging Landsat 4, 5, 7, 8, and 9 into a single time series. Two corrections are applied during acquisition to ensure cross-sensor consistency:
+
+1. **SR scaling** — Collection 2 DN values are converted to physical reflectance using the standard scale factor and offset (`reflectance = DN × 0.0000275 − 0.2`). The offset does not cancel in the NDVI formula and causes systematic underestimation if omitted.
+2. **Spectral harmonization** — L8 and L9 OLI sensors have narrower bandpasses than TM/ETM+, producing NDVI values ~0.02–0.05 lower for the same surface. Roy et al. (2016, *RSE* 185:57–70, Table 2) linear coefficients are applied to OLI red and NIR reflectance to bring them into ETM+ equivalent units before NDVI is computed.
 
 > **Note on the 1980–1984 gap:** Landsat 5 launched March 1984. The only sensor available before that date is NOAA AVHRR (from 1981), which has 8 km resolution — a single pixel covering the entire study area. Pixel-scale NDVI is not meaningful at that resolution for a 580 × 440 m site. The practical earliest date for reliable 30 m NDVI here is therefore **1984**.
 
@@ -161,25 +164,52 @@ def mask_clouds_l2(image):
     return image.updateMask(clear)
 ```
 
-## 1A.4 NDVI Functions
+## 1A.4 NDVI Functions with SR Scaling and Harmonization
 
-NDVI = (NIR − Red) / (NIR + Red). Band numbering differs between sensor families — TM/ETM+ use Bands 3/4, OLI uses Bands 4/5.
+NDVI = (NIR − Red) / (NIR + Red). Two steps precede the computation:
+
+1. **Scale to physical reflectance** — Collection 2 DNs are stored as integers;
+   multiply by 0.0000275 and subtract 0.2 to get values in the 0–1 range.
+   `normalizedDifference()` is intentionally avoided here because it operates on
+   raw DNs and the offset would introduce error.
+2. **Harmonize OLI → ETM+** (L8/L9 only) — apply Roy et al. (2016) Table 2
+   coefficients to the red and NIR reflectance before computing NDVI.
+   Verify coefficients against the original paper if reusing this code.
 
 ```{python}
 #| label: gee-ndvi
 #| eval: false
 
+# Collection 2 Level-2 SR scale and offset (all sensors)
+C2_SCALE  = 0.0000275
+C2_OFFSET = -0.2
+
+# Roy et al. (2016) OLI → ETM+ harmonization coefficients
+# Source: Remote Sensing of Environment 185:57–70, Table 2
+# Direction: ETM+_reflectance ≈ slope × OLI_reflectance + intercept
+HARM_RED_SLOPE, HARM_RED_INT = 0.9590, 0.0029
+HARM_NIR_SLOPE, HARM_NIR_INT = 0.9828, 0.0021
+
+
 def add_ndvi_tm(image):
-    """NDVI for Landsat 4, 5 (TM) and 7 (ETM+)."""
-    return image.addBands(
-        image.normalizedDifference(["SR_B4", "SR_B3"]).rename("NDVI")
-    )
+    """NDVI for Landsat 4, 5 (TM) and 7 (ETM+) — with C2 SR scaling."""
+    red = image.select("SR_B3").multiply(C2_SCALE).add(C2_OFFSET)
+    nir = image.select("SR_B4").multiply(C2_SCALE).add(C2_OFFSET)
+    ndvi = nir.subtract(red).divide(nir.add(red)).rename("NDVI")
+    return image.addBands(ndvi)
+
 
 def add_ndvi_oli(image):
-    """NDVI for Landsat 8 and 9 (OLI / OLI-2)."""
-    return image.addBands(
-        image.normalizedDifference(["SR_B5", "SR_B4"]).rename("NDVI")
-    )
+    """NDVI for Landsat 8/9 (OLI/OLI-2) — C2 SR scaling + Roy et al. (2016) harmonization."""
+    # Step 1: scale to physical reflectance
+    red = image.select("SR_B4").multiply(C2_SCALE).add(C2_OFFSET)
+    nir = image.select("SR_B5").multiply(C2_SCALE).add(C2_OFFSET)
+    # Step 2: transform OLI reflectance to ETM+ equivalent
+    red = red.multiply(HARM_RED_SLOPE).add(HARM_RED_INT)
+    nir = nir.multiply(HARM_NIR_SLOPE).add(HARM_NIR_INT)
+    # Step 3: NDVI on harmonized physical reflectance
+    ndvi = nir.subtract(red).divide(nir.add(red)).rename("NDVI")
+    return image.addBands(ndvi)
 ```
 
 ## 1A.5 Assemble Collections
@@ -334,7 +364,10 @@ def apply_cloud_mask(qa_array: np.ndarray) -> np.ndarray:
 
 ## 1B.4 Extract NDVI Per Scene
 
-The TM/ETM+ vs. OLI band-naming difference means we must inspect `platform` metadata before selecting the red and NIR assets.
+The TM/ETM+ vs. OLI band-naming difference means we must inspect `platform`
+metadata before selecting the red and NIR assets. After reading, we apply the
+same two corrections as Option A: (1) C2 SR scaling to physical reflectance,
+and (2) Roy et al. (2016) harmonization for OLI sensors.
 
 ```{python}
 #| label: pc-extract
@@ -348,6 +381,14 @@ BAND_MAP = {
     "landsat-8": ("SR_B4", "SR_B5"),   # OLI:     red = B4, NIR = B5
     "landsat-9": ("SR_B4", "SR_B5"),
 }
+
+OLI_SENSORS = {"landsat-8", "landsat-9"}
+
+# Roy et al. (2016) OLI → ETM+ harmonization coefficients
+# Source: Remote Sensing of Environment 185:57–70, Table 2
+# Verify against original paper before reusing.
+HARM_RED = (0.9590, 0.0029)   # (slope, intercept) for red band
+HARM_NIR = (0.9828, 0.0021)   # (slope, intercept) for NIR band
 
 bbox = [SW_LON, SW_LAT, NE_LON, NE_LAT]
 records = []
@@ -373,10 +414,21 @@ for item in tqdm(items, desc="Processing scenes"):
 
         clear = apply_cloud_mask(qa.values)
 
-        r = red.values.astype(float); r[~clear] = np.nan
-        n = nir.values.astype(float); n[~clear] = np.nan
+        # Step 1: scale DNs to physical reflectance (C2: DN × 0.0000275 − 0.2)
+        r_phys = red.values.astype(float) * 0.0000275 - 0.2
+        n_phys = nir.values.astype(float) * 0.0000275 - 0.2
 
-        ndvi_mean = float(np.nanmean((n - r) / (n + r + 1e-10)))
+        # Apply cloud mask
+        r_phys[~clear] = np.nan
+        n_phys[~clear] = np.nan
+
+        # Step 2: harmonize OLI → ETM+ (Roy et al. 2016, Table 2)
+        if platform in OLI_SENSORS:
+            r_phys = r_phys * HARM_RED[0] + HARM_RED[1]
+            n_phys = n_phys * HARM_NIR[0] + HARM_NIR[1]
+
+        # Step 3: NDVI on harmonized physical reflectance
+        ndvi_mean = float(np.nanmean((n_phys - r_phys) / (n_phys + r_phys + 1e-10)))
 
         if not np.isnan(ndvi_mean):
             records.append({
@@ -522,48 +574,79 @@ aoi_view <- cube_view(
 
 ## 1C.5 Compute NDVI and Reduce to Spatial Mean
 
+The `apply_pixel()` expressions inline all three processing steps: cloud masking,
+SR scaling (DN × 0.0000275 − 0.2), and — for OLI — Roy et al. (2016)
+harmonization. Because TM and OLI collections are processed separately, we use
+two specialised helpers rather than a single generic function.
+
 ```{r}
 #| label: r-only-ndvi
 #| eval: false
 
-# Cloud-mask expression: QA bits 1, 3, 4 — same logic as Options A & B.
-# gdalcubes apply_pixel() accepts C-style expressions over band names.
-CLOUD_MASK_EXPR <- "
-  (((int)qa & (1 << 1)) == 0) &&
-  (((int)qa & (1 << 3)) == 0) &&
-  (((int)qa & (1 << 4)) == 0)
-"
+# C-style cloud-clear test used inside apply_pixel() expressions.
+# Bits 1, 3, 4 of QA_PIXEL flag dilated cloud, cloud, and cloud shadow.
+CLEAR <- "(((int)qa & (1<<1))==0 && ((int)qa & (1<<3))==0 && ((int)qa & (1<<4))==0)"
 
-process_collection <- function(col, sensor_label) {
+# C2 SR scale expression: converts raw DN → physical reflectance
+scale_expr <- function(band) sprintf("%s * 0.0000275 - 0.2", band)
+
+# Roy et al. (2016) OLI → ETM+ harmonization applied after scaling.
+# Source: Remote Sensing of Environment 185:57–70, Table 2
+# Verify coefficients against original paper before reusing.
+harm_expr <- function(band, slope, intercept) {
+  sprintf("%.4f * (%s) + %.4f", slope, scale_expr(band), intercept)
+}
+
+
+# ── TM / ETM+ (L4, L5, L7): scale only, no harmonization needed
+process_tm <- function(col, sensor_label) {
   if (is.null(col)) return(tibble())
 
   raster_cube(col, aoi_view) |>
-    # Apply cloud mask: set red and nir to NA where not clear
     apply_pixel(
       c(
-        sprintf("(%s) ? red : NAN", CLOUD_MASK_EXPR),
-        sprintf("(%s) ? nir : NAN", CLOUD_MASK_EXPR)
+        sprintf("%s ? %s : NAN", CLEAR, scale_expr("red")),
+        sprintf("%s ? %s : NAN", CLEAR, scale_expr("nir"))
       ),
-      names = c("red_clear", "nir_clear")
+      names = c("red_phys", "nir_phys")
     ) |>
-    # Compute NDVI
     apply_pixel(
-      "(nir_clear - red_clear) / (nir_clear + red_clear)",
+      "(nir_phys - red_phys) / (nir_phys + red_phys)",
       names = "ndvi"
     ) |>
-    # Spatial mean per time step — collapses the small AOI to one value per day
     reduce_space("mean(ndvi)") |>
     as_tibble() |>
-    rename(date = time, ndvi = ndvi) |>
+    rename(date = time) |>
     filter(!is.na(ndvi)) |>
-    mutate(
-      date   = as.Date(date),
-      sensor = sensor_label
-    )
+    mutate(date = as.Date(date), sensor = sensor_label)
 }
 
-ts_tm  <- process_collection(col_tm,  "LANDSAT_TM_ETM")
-ts_oli <- process_collection(col_oli, "LANDSAT_OLI")
+
+# ── OLI (L8, L9): scale + Roy et al. (2016) harmonization
+process_oli <- function(col, sensor_label) {
+  if (is.null(col)) return(tibble())
+
+  raster_cube(col, aoi_view) |>
+    apply_pixel(
+      c(
+        sprintf("%s ? %s : NAN", CLEAR, harm_expr("red", 0.9590, 0.0029)),
+        sprintf("%s ? %s : NAN", CLEAR, harm_expr("nir", 0.9828, 0.0021))
+      ),
+      names = c("red_harm", "nir_harm")
+    ) |>
+    apply_pixel(
+      "(nir_harm - red_harm) / (nir_harm + red_harm)",
+      names = "ndvi"
+    ) |>
+    reduce_space("mean(ndvi)") |>
+    as_tibble() |>
+    rename(date = time) |>
+    filter(!is.na(ndvi)) |>
+    mutate(date = as.Date(date), sensor = sensor_label)
+}
+
+ts_tm  <- process_tm(col_tm,   "LANDSAT_TM_ETM")
+ts_oli <- process_oli(col_oli, "LANDSAT_OLI")
 
 df_r <- bind_rows(ts_tm, ts_oli) |>
   arrange(date) |>
@@ -779,7 +862,14 @@ cat("Saved → data/ndvi_clean.csv\n")
 
 # Part 3 — Analysis & Visualisation (R)
 
-## 3.1 Long-Term Time Series
+## 3.0 Cross-Sensor Consistency Check
+
+Before interpreting trends, verify that harmonization has reduced the systematic
+NDVI offset between L7 ETM+ and L8 OLI. The two sensors operated simultaneously
+from April 2013 to December 2021, giving a direct overlap window for comparison.
+After correct scaling and harmonization, the monthly mean NDVI distributions for
+L7 and L8 should be indistinguishable. A persistent offset would indicate that
+the coefficients need review.
 
 ```{r}
 #| label: r-load-clean
@@ -793,6 +883,54 @@ library(scales)
 ndvi_clean <- read_csv("data/ndvi_clean.csv",
                        col_types = cols(date = col_date()))
 ```
+
+```{r}
+#| label: fig-sensor-overlap
+#| eval: true
+#| fig-cap: "Monthly mean NDVI for L7 and L8 during their overlap period (2013–2021). After harmonization the distributions should be centred at similar values."
+
+# L7/L8 overlap window
+OVERLAP_START <- as.Date("2013-04-11")
+OVERLAP_END   <- as.Date("2021-12-31")
+
+# Identify the sensor column values for L7 and L8 regardless of which
+# acquisition option was used (sensor names differ slightly between options)
+overlap <- ndvi_clean |>
+  filter(date >= OVERLAP_START, date <= OVERLAP_END) |>
+  filter(grepl("7|ETM", sensor, ignore.case = TRUE) |
+         grepl("8|OLI",  sensor, ignore.case = TRUE)) |>
+  mutate(sensor_label = case_when(
+    grepl("7|ETM", sensor, ignore.case = TRUE) ~ "Landsat 7 ETM+",
+    grepl("8|OLI", sensor, ignore.case = TRUE) ~ "Landsat 8 OLI",
+    TRUE ~ sensor
+  )) |>
+  mutate(ym = floor_date(date, "month")) |>
+  group_by(ym, sensor_label) |>
+  summarise(ndvi = mean(ndvi, na.rm = TRUE), .groups = "drop")
+
+p_ts <- ggplot(overlap, aes(x = ym, y = ndvi, colour = sensor_label)) +
+  geom_line(alpha = 0.7, linewidth = 0.6) +
+  geom_smooth(se = FALSE, linewidth = 1.2, method = "loess", span = 0.3) +
+  scale_colour_manual(values = c("Landsat 7 ETM+" = "#e41a1c",
+                                  "Landsat 8 OLI"  = "#377eb8")) +
+  labs(title = "L7 vs L8 monthly mean NDVI during overlap (2013–2021)",
+       subtitle = "Indistinguishable lines indicate successful harmonization",
+       x = NULL, y = "Monthly mean NDVI", colour = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+
+p_box <- ggplot(overlap, aes(x = sensor_label, y = ndvi, fill = sensor_label)) +
+  geom_boxplot(alpha = 0.6, outlier.size = 0.8) +
+  scale_fill_manual(values = c("Landsat 7 ETM+" = "#e41a1c",
+                                "Landsat 8 OLI"  = "#377eb8")) +
+  labs(x = NULL, y = "Monthly mean NDVI") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none")
+
+p_ts + p_box + plot_layout(widths = c(3, 1))
+```
+
+## 3.1 Long-Term Time Series
 
 ```{r}
 #| label: fig-clean-ts
