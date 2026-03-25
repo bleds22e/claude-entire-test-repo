@@ -1,0 +1,25 @@
+{
+  "cli_version": "0.5.1",
+  "checkpoint_id": "620b2d96f119",
+  "strategy": "manual-commit",
+  "branch": "main",
+  "checkpoints_count": 5,
+  "files_touched": [
+    "ndvi_analysis.qmd"
+  ],
+  "sessions": [
+    {
+      "metadata": "/62/0b2d96f119/0/metadata.json",
+      "transcript": "/62/0b2d96f119/0/full.jsonl",
+      "content_hash": "/62/0b2d96f119/0/content_hash.txt",
+      "prompt": "/62/0b2d96f119/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 31,
+    "cache_creation_tokens": 12782,
+    "cache_read_tokens": 1778658,
+    "output_tokens": 10024,
+    "api_call_count": 15
+  }
+}

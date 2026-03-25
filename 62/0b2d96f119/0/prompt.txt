@@ -1,0 +1,45 @@
+git push
+
+---
+
+make_collection <- function(features, red_asset, nir_asset) {
+  if (length(features) == 0) return(NULL)
+  stac_image_collection(
+    features,
+    asset_names = c(red_asset, nir_asset, "QA_PIXEL"),
+    band_names  = c("red", "nir", "qa")
+  )
+}
+
+col_tm  <- make_collection(features_tm,  "SR_B3", "SR_B4")
+col_oli <- make_collection(features_oli, "SR_B4", "SR_B5")
+
+---
+
+I am getting an error when I run those lines of code
+
+---
+
+Error in stac_image_collection(features, asset_names = c(red_asset, nir_asset,  : 
+  unused argument (band_names = c("red", "nir", "qa"))
+
+---
+
+I now get a different error
+
+---
+
+I now get a different error
+
+---
+
+STAC asset with name 'SR_B3' does not exist and will be ignored
+STAC asset with name 'SR_B4' does not exist and will be ignored
+STAC asset with name 'QA_PIXEL' does not exist and will be ignored
+Error in data.frame(id = 1:length(bands), name = bands, type = "", offset = NA, :
+arguments imply differing number of rows: 2, 0, 1
+
+---
+
+Error when running: ts_tm  <- process_tm(col_tm,   "LANDSAT_TM_ETM")
+ts_oli <- process_oli(col_oli, "LANDSAT_OLI")
