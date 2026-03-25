@@ -3,7 +3,7 @@
   "checkpoint_id": "620b2d96f119",
   "strategy": "manual-commit",
   "branch": "main",
-  "checkpoints_count": 5,
+  "checkpoints_count": 10,
   "files_touched": [
     "ndvi_analysis.qmd"
   ],
@@ -13,13 +13,19 @@
       "transcript": "/62/0b2d96f119/0/full.jsonl",
       "content_hash": "/62/0b2d96f119/0/content_hash.txt",
       "prompt": "/62/0b2d96f119/0/prompt.txt"
+    },
+    {
+      "metadata": "/62/0b2d96f119/1/metadata.json",
+      "transcript": "/62/0b2d96f119/1/full.jsonl",
+      "content_hash": "/62/0b2d96f119/1/content_hash.txt",
+      "prompt": "/62/0b2d96f119/1/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 31,
-    "cache_creation_tokens": 12782,
-    "cache_read_tokens": 1778658,
-    "output_tokens": 10024,
-    "api_call_count": 15
+    "input_tokens": 49,
+    "cache_creation_tokens": 22518,
+    "cache_read_tokens": 1900774,
+    "output_tokens": 11014,
+    "api_call_count": 23
   }
 }

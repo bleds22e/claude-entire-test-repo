@@ -1,0 +1,17 @@
+entire status
+
+---
+
+how do I fix "ModuleNotFoundError"
+
+---
+
+How do I install the packages?
+
+---
+
+how do I install packages in Python
+
+---
+
+bash: pip: command not found
