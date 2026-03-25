@@ -1,0 +1,29 @@
+git push
+
+---
+
+git pull
+
+---
+
+brew upgrade claude-code
+
+---
+
+in the code, are there any other benefits to using python vs r? is one better at dealing with cloud coverage or missing values or something else?
+
+---
+
+are there major differences in the sources of the ndvi values?
+
+---
+
+does this code take differences in the landsat datasets through time into account?
+
+---
+
+git add .
+
+---
+
+got status
